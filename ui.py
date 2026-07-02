@@ -1,3 +1,4 @@
+import random
 import sys
 import cv2
 import numpy as np
@@ -36,25 +37,41 @@ class ReIDModel:
 # =========================
 class GlobalMemory:
     def __init__(self):
-        self.data = {}  # id -> mean feature
+        self.base_data = {}  # id -> mean feature
+        self.real_time_data = {i: [] for i in range(8)}  # id -> mean feature
 
     def add(self, gid, features):
-        mean = np.mean(features, axis=0)
-        mean = mean / np.linalg.norm(mean)
-        self.data[gid] = mean
+        # mean = np.mean(features, axis=0)
+        # mean = mean / np.linalg.norm(mean) # 이건 내일 하자.....
+        self.base_data[gid] = features
 
     def match(self, feature):
         best_id = None
         best_score = -1
 
-        for gid, ref in self.data.items():
-            score = np.dot(feature, ref)
+        max_num = 100 # 최대 몇개의 feature을 평균 낼건지
+        base_num = 20 # 첫 feature 데이터를 몇개 사용 할건지
+        real_time_num = 80 # 실시간 feature 데이터를 몇개 사용 할건지
+
+        for gid, features in self.base_data.items():
+            features = random.sample(features, max(base_num, max_num-len(self.real_time_data[gid])))
+            real_time_features = random.sample(self.real_time_data[gid], max_num-len(features))
+            features = features + real_time_features
+
+            mean = np.mean(features, axis=0)
+            mean = mean / np.linalg.norm(mean)
+
+            score = np.dot(feature, mean)
 
             if score > best_score:
                 best_score = score
                 best_id = gid
 
         if best_score > 0.75:
+            self.real_time_data[best_id].append(feature)
+            if len(self.real_time_data[best_id]) > real_time_num:
+                self.real_time_data[best_id].pop(0)
+
             return best_id, best_score
 
         return None, best_score
@@ -121,9 +138,8 @@ class Worker(QThread):
     # FEATURE CAPTURE
     # =========================
     def capture(self, frame):
-
         # if len(self.buffer) == 0:
-        self.status_signal.emit(f"Capturing ID {self.target_id}...  {len(self.buffer)}/50")
+        self.status_signal.emit(f"Capturing ID {self.target_id}...  {len(self.buffer)}/100")
 
         results = self.model(frame, classes=[0], verbose=False)[0]
 
@@ -137,13 +153,12 @@ class Worker(QThread):
                 if feat is not None:
                     self.buffer.append(feat)
 
-        if len(self.buffer) > 50:
+        if len(self.buffer) > 100:
 
             self.memory.add(self.target_id, self.buffer)
 
             self.status_signal.emit(f"ID {self.target_id} SAVED ✔")
 
-            self.buffer = []
             self.mode = "idle"
 
     # =========================
@@ -275,6 +290,7 @@ class MainWindow(QMainWindow):
 
         self.worker.target_id = self.selected_id
         self.worker.mode = "capture"
+        self.worker.buffer = []
         self.status.setText(f"Capturing ID {self.selected_id}...")
 
     # =========================
