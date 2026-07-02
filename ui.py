@@ -88,7 +88,7 @@ class Worker(QThread):
 
         self.cap = cv2.VideoCapture(0)
         # self.model = YOLO("yolo11n.pt")
-        self.model = YOLO("yolo11n-seg.pt")
+        self.model = YOLO("yolo11n-seg2.pt")
         self.reid = ReIDModel()
 
         self.memory = memory
@@ -145,7 +145,7 @@ class Worker(QThread):
 
         results = self.model(frame, classes=[0], verbose=False, retina_masks=True)[0]
 
-        if results.boxes is None:
+        if results.boxes is None or results.masks is None:
             return
 
         boxes = results.boxes.xyxy.cpu().numpy().astype(int)
@@ -154,44 +154,13 @@ class Worker(QThread):
         h, w = frame.shape[:2]
 
         for idx, (box, mask) in enumerate(zip(boxes, masks)):
-
-            x1, y1, x2, y2 = box
-
-            # 이미지 범위 보정
-            x1 = max(0, min(x1, w - 1))
-            y1 = max(0, min(y1, h - 1))
-            x2 = max(0, min(x2, w))
-            y2 = max(0, min(y2, h))
-
-            if x2 <= x1 or y2 <= y1:
+            feat = self.get_feature(frame, box, mask, h, w)
+            if feat is None:
                 continue
 
-            crop = frame[y1:y2, x1:x2].copy()
-
-            if crop.size == 0:
-                continue
-
-            x1, y1, x2, y2 = map(int, box)
-            crop = frame[y1:y2, x1:x2]
-
-            # mask crop
-            crop_mask = mask[y1:y2, x1:x2]
-
-            # mask 이진화
-            crop_mask = (crop_mask > self.mask_thres).astype(np.uint8)
-
-            # crop 영역 안에서 배경 흰색 처리
-            output_crop = self.apply_background_white(
-                image=crop,
-                person_mask=crop_mask
-            )
-
-            feat = self.reid.extract(output_crop)
-            if feat is not None:
-                self.buffer.append(feat)
+            self.buffer.append(feat)
 
         if len(self.buffer) > 100:
-
             self.memory.add(self.target_id, self.buffer)
 
             self.status_signal.emit(f"ID {self.target_id} SAVED ✔")
@@ -221,39 +190,7 @@ class Worker(QThread):
         h, w = frame.shape[:2]
 
         for idx, (box, mask) in enumerate(zip(boxes, masks)):
-
-            x1, y1, x2, y2 = box
-
-            # 이미지 범위 보정
-            x1 = max(0, min(x1, w - 1))
-            y1 = max(0, min(y1, h - 1))
-            x2 = max(0, min(x2, w))
-            y2 = max(0, min(y2, h))
-
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            crop = frame[y1:y2, x1:x2].copy()
-
-            if crop.size == 0:
-                continue
-
-            x1, y1, x2, y2 = map(int, box)
-            crop = frame[y1:y2, x1:x2]
-
-            # mask crop
-            crop_mask = mask[y1:y2, x1:x2]
-
-            # mask 이진화
-            crop_mask = (crop_mask > self.mask_thres).astype(np.uint8)
-
-            # crop 영역 안에서 배경 흰색 처리
-            output_crop = self.apply_background_white(
-                image=crop,
-                person_mask=crop_mask
-            )
-
-            feat = self.reid.extract(output_crop)
+            feat = self.get_feature(frame, box, mask, h, w)
             if feat is None:
                 continue
 
@@ -266,9 +203,47 @@ class Worker(QThread):
                 color = (0, 255, 0)
                 label = f"GID:{gid} Score:{score}"
 
+            x1, y1, x2, y2 = box
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, label, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+
+    def get_feature(self, frame, box, mask, h, w):
+        x1, y1, x2, y2 = box
+
+        # 이미지 범위 보정
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2].copy()
+
+        if crop.size == 0:
+            return None
+
+        x1, y1, x2, y2 = map(int, box)
+        crop = frame[y1:y2, x1:x2]
+
+        # mask crop
+        crop_mask = mask[y1:y2, x1:x2]
+
+        # mask 이진화
+        crop_mask = (crop_mask > self.mask_thres).astype(np.uint8)
+
+        # crop 영역 안에서 배경 흰색 처리
+        output_crop = self.apply_background_white(
+            image=crop,
+            person_mask=crop_mask
+        )
+
+        feat = self.reid.extract(output_crop)
+
+        return feat
 
 
     def apply_background_white(self, image, person_mask):
@@ -335,7 +310,6 @@ class MainWindow(QMainWindow):
         id_layout = QHBoxLayout()
 
         for i in range(8):
-
             btn = QPushButton(f"ID {i}")
             btn.clicked.connect(lambda _, x=i: self.select_id(x))
 
@@ -421,7 +395,6 @@ class MainWindow(QMainWindow):
     # LIVE TOGGLE
     # =========================
     def toggle_live(self):
-
         self.worker.toggle_live()
 
         if self.worker.live_on:

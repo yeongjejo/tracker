@@ -9,7 +9,7 @@ from ultralytics import YOLO
 # ==============================
 
 IMAGE_PATH = "img.png"          # 입력 이미지 경로
-MODEL_PATH = "yolo11n-seg.pt"     # 또는 "yolov8n-seg.pt"
+MODEL_PATH = "yolo11n-seg2.pt"  # 또는 "yolov8n-seg.pt"
 OUTPUT_DIR = "output"
 
 CONF_THRES = 0.35                 # 사람 검출 신뢰도
