@@ -87,7 +87,8 @@ class Worker(QThread):
         super().__init__()
 
         self.cap = cv2.VideoCapture(0)
-        self.model = YOLO("yolo11n.pt")
+        # self.model = YOLO("yolo11n.pt")
+        self.model = YOLO("yolo11n-seg.pt")
         self.reid = ReIDModel()
 
         self.memory = memory
@@ -97,6 +98,8 @@ class Worker(QThread):
 
         self.target_id = None
         self.buffer = []
+
+        self.mask_thres = 0.5
 
     def toggle_live(self):
         self.live_on = not self.live_on
@@ -140,17 +143,52 @@ class Worker(QThread):
         # if len(self.buffer) == 0:
         self.status_signal.emit(f"Capturing ID {self.target_id}...  {len(self.buffer)}/100")
 
-        results = self.model(frame, classes=[0], verbose=False)[0]
+        results = self.model(frame, classes=[0], verbose=False, retina_masks=True)[0]
 
-        if results.boxes is not None:
-            for box in results.boxes.xyxy:
+        if results.boxes is None:
+            return
 
-                x1, y1, x2, y2 = map(int, box)
-                crop = frame[y1:y2, x1:x2]
+        boxes = results.boxes.xyxy.cpu().numpy().astype(int)
+        masks = results.masks.data.cpu().numpy()
 
-                feat = self.reid.extract(crop)
-                if feat is not None:
-                    self.buffer.append(feat)
+        h, w = frame.shape[:2]
+
+        for idx, (box, mask) in enumerate(zip(boxes, masks)):
+
+            x1, y1, x2, y2 = box
+
+            # 이미지 범위 보정
+            x1 = max(0, min(x1, w - 1))
+            y1 = max(0, min(y1, h - 1))
+            x2 = max(0, min(x2, w))
+            y2 = max(0, min(y2, h))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            crop = frame[y1:y2, x1:x2].copy()
+
+            if crop.size == 0:
+                continue
+
+            x1, y1, x2, y2 = map(int, box)
+            crop = frame[y1:y2, x1:x2]
+
+            # mask crop
+            crop_mask = mask[y1:y2, x1:x2]
+
+            # mask 이진화
+            crop_mask = (crop_mask > self.mask_thres).astype(np.uint8)
+
+            # crop 영역 안에서 배경 흰색 처리
+            output_crop = self.apply_background_white(
+                image=crop,
+                person_mask=crop_mask
+            )
+
+            feat = self.reid.extract(output_crop)
+            if feat is not None:
+                self.buffer.append(feat)
 
         if len(self.buffer) > 100:
 
@@ -166,22 +204,56 @@ class Worker(QThread):
             del self.memory.base_data[id]
         self.memory.real_time_data[id] = []
 
+
     # =========================
     # LIVE MODE
     # =========================
     def live(self, frame):
 
-        results = self.model(frame, classes=[0], verbose=False)[0]
+        results = self.model(frame, classes=[0], verbose=False, retina_masks=True)[0]
 
         if results.boxes is None:
             return
 
-        for box in results.boxes.xyxy:
+        boxes = results.boxes.xyxy.cpu().numpy().astype(int)
+        masks = results.masks.data.cpu().numpy()
+
+        h, w = frame.shape[:2]
+
+        for idx, (box, mask) in enumerate(zip(boxes, masks)):
+
+            x1, y1, x2, y2 = box
+
+            # 이미지 범위 보정
+            x1 = max(0, min(x1, w - 1))
+            y1 = max(0, min(y1, h - 1))
+            x2 = max(0, min(x2, w))
+            y2 = max(0, min(y2, h))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            crop = frame[y1:y2, x1:x2].copy()
+
+            if crop.size == 0:
+                continue
 
             x1, y1, x2, y2 = map(int, box)
             crop = frame[y1:y2, x1:x2]
 
-            feat = self.reid.extract(crop)
+            # mask crop
+            crop_mask = mask[y1:y2, x1:x2]
+
+            # mask 이진화
+            crop_mask = (crop_mask > self.mask_thres).astype(np.uint8)
+
+            # crop 영역 안에서 배경 흰색 처리
+            output_crop = self.apply_background_white(
+                image=crop,
+                person_mask=crop_mask
+            )
+
+            feat = self.reid.extract(output_crop)
             if feat is None:
                 continue
 
@@ -197,6 +269,39 @@ class Worker(QThread):
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, label, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+
+    def apply_background_white(self, image, person_mask):
+        """
+        사람 영역은 원본 유지, 배경은 흰색으로 처리
+        """
+        alpha = self.smooth_mask(person_mask, blur_size=21)
+        alpha_3ch = np.repeat(alpha[:, :, None], 3, axis=2)
+
+        white_bg = np.ones_like(image, dtype=np.uint8) * 255
+
+        output = image.astype(np.float32) * alpha_3ch + white_bg.astype(np.float32) * (1 - alpha_3ch)
+        output = np.clip(output, 0, 255).astype(np.uint8)
+
+        return output
+
+    def smooth_mask(self, binary_mask, blur_size=21):
+        """
+        마스크 경계를 부드럽게 만들기 위한 soft alpha mask 생성
+        """
+        mask = (binary_mask * 255).astype(np.uint8)
+
+        # 작은 구멍 메우기
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        # 경계 부드럽게
+        # blur_size = make_odd_kernel(blur_size)
+        # mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+
+        # 0~1 alpha로 변환
+        alpha = mask.astype(np.float32) / 255.0
+        return alpha
 
 
 # =========================
