@@ -42,21 +42,20 @@ class GlobalMemory:
 
     def add(self, gid, features):
         # mean = np.mean(features, axis=0)
-        # mean = mean / np.linalg.norm(mean) # 이건 내일 하자.....
+        # mean = mean / np.linalg.norm(mean)
         self.base_data[gid] = features
 
     def match(self, feature):
         best_id = None
         best_score = -1
 
-        max_num = 100 # 최대 몇개의 feature을 평균 낼건지
+        max_num = 50 # 최대 몇개의 feature을 평균 낼건지
         base_num = 20 # 첫 feature 데이터를 몇개 사용 할건지
-        real_time_num = 80 # 실시간 feature 데이터를 몇개 사용 할건지
+        real_time_num = 30 # 실시간 feature 데이터를 몇개 사용 할건지
 
         for gid, features in self.base_data.items():
             features = random.sample(features, max(base_num, max_num-len(self.real_time_data[gid])))
-            real_time_features = random.sample(self.real_time_data[gid], max_num-len(features))
-            features = features + real_time_features
+            features = features + self.real_time_data[gid]
 
             mean = np.mean(features, axis=0)
             mean = mean / np.linalg.norm(mean)
@@ -161,6 +160,12 @@ class Worker(QThread):
 
             self.mode = "idle"
 
+    def clear(self, id):
+        self.buffer = []
+        if id in self.memory.base_data.keys():
+            del self.memory.base_data[id]
+        self.memory.real_time_data[id] = []
+
     # =========================
     # LIVE MODE
     # =========================
@@ -232,9 +237,13 @@ class MainWindow(QMainWindow):
             label = QLabel("❌")
             label.setAlignment(Qt.AlignCenter)
 
+            clear_btn = QPushButton(f"Clear ID {i}")
+            clear_btn.clicked.connect(lambda _, x=i: self.clear(x))
+
             vbox = QVBoxLayout()
             vbox.addWidget(btn)
             vbox.addWidget(label)
+            vbox.addWidget(clear_btn)
 
             box = QWidget()
             box.setLayout(vbox)
@@ -290,8 +299,18 @@ class MainWindow(QMainWindow):
 
         self.worker.target_id = self.selected_id
         self.worker.mode = "capture"
-        self.worker.buffer = []
+        self.clear(self.selected_id)
         self.status.setText(f"Capturing ID {self.selected_id}...")
+
+
+    # =========================
+    # FEATURE CLEAR
+    # =========================
+    def clear(self, id):
+        self.worker.clear(id)
+        self.id_labels[id].setText("❌")
+        print("FEATURE CLEAR!!")
+
 
     # =========================
     # LIVE TOGGLE
