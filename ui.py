@@ -212,7 +212,7 @@ class Worker(QThread):
 
         results = self.model(frame, classes=[0], verbose=False, retina_masks=True)[0]
 
-        if results.boxes is None:
+        if results.boxes is None or results.masks is None:
             return
 
         boxes = results.boxes.xyxy.cpu().numpy().astype(int)
