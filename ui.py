@@ -210,22 +210,6 @@ class Worker(QThread):
 
 
     def get_feature(self, frame, box, mask, h, w):
-        x1, y1, x2, y2 = box
-
-        # 이미지 범위 보정
-        x1 = max(0, min(x1, w - 1))
-        y1 = max(0, min(y1, h - 1))
-        x2 = max(0, min(x2, w))
-        y2 = max(0, min(y2, h))
-
-        if x2 <= x1 or y2 <= y1:
-            return None
-
-        crop = frame[y1:y2, x1:x2].copy()
-
-        if crop.size == 0:
-            return None
-
         x1, y1, x2, y2 = map(int, box)
         crop = frame[y1:y2, x1:x2]
 
