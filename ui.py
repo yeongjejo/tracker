@@ -18,8 +18,13 @@ from torchreid.reid.utils.feature_extractor import FeatureExtractor
 class ReIDModel:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # self.extractor = FeatureExtractor(
+        #     model_name="osnet_ibn_x1_0",
+        #     device=self.device
+        # )
+
         self.extractor = FeatureExtractor(
-            model_name="osnet_ibn_x1_0",
+            model_name="osnet_ain_x1_0",
             device=self.device
         )
 
@@ -49,15 +54,59 @@ class GlobalMemory:
         best_id = None
         best_score = -1
 
-        max_num = 50 # 최대 몇개의 feature을 평균 낼건지
-        base_num = 20 # 첫 feature 데이터를 몇개 사용 할건지
-        real_time_num = 30 # 실시간 feature 데이터를 몇개 사용 할건지
+        base_max_num = 50 # 첫 feature 데이터를 몇개을 평균 낼건지
+        real_time_num = 100  # 실시간 feature 데이터를 몇개 사용 할건지
 
-        for gid, features in self.base_data.items():
-            features = random.sample(features, max(base_num, max_num-len(self.real_time_data[gid])))
-            features = features + self.real_time_data[gid]
+        rt1_score = 0.0
+        rt2_score = 0.0
+        base_score = 0.0
+        for gid, base_features in self.base_data.items():
+            # -------------------------
+            # 1. base feature 평균
+            # -------------------------
+            # 50개 랜덤 샘플로 사용할경우
+            base_sample_num = min(base_max_num, len(base_features))
+            base_sample = random.sample(base_features, base_sample_num)
+            # 그냥 100개 전부 사용할 경우
+            # base_sample = base_features
 
-            mean = np.mean(features, axis=0)
+            base_mean = np.mean(base_sample, axis=0)
+            base_mean = base_mean / np.linalg.norm(base_mean)
+
+            # -------------------------
+            # 2. real-time feature 평균
+            # -------------------------
+            if len(self.real_time_data[gid]) > 0:
+                if len(self.real_time_data[gid]) > 1:
+                    rt_mean1 = np.mean(self.real_time_data[gid][:50], axis=0)
+                    rt_mean1 = rt_mean1 / np.linalg.norm(rt_mean1)
+
+                    rt_mean2 = np.mean(self.real_time_data[gid], axis=0)
+                    rt_mean2 = rt_mean2 / np.linalg.norm(rt_mean2)
+
+                    # 개수와 상관없이 비율로 평균 조절
+                    mean = (base_mean * 0.3) + (rt_mean1 * 0.0) + (rt_mean2 * 0.7)
+
+                    # 각 확률 시각화 해보고 싶어 이거 for문 여기서 하는게 맞나? 변수 첫 초기화 어디서 해야할까??
+                    # 와서 이거 해보면 되겠네
+                    base_score = np.dot(feature,base_mean  / np.linalg.norm(base_mean))
+                    rt1_score = np.dot(feature,rt_mean1 / np.linalg.norm(rt_mean1))
+                    rt2_score = np.dot(feature,rt_mean2 / np.linalg.norm(rt_mean2))
+
+                else:
+                    rt_mean = np.mean(self.real_time_data[gid], axis=0)
+                    rt_mean = rt_mean / np.linalg.norm(rt_mean)
+
+                    # 개수와 상관없이 비율로 평균 조절
+                    mean = (base_mean * 0.5) + (rt_mean * 0.7)
+
+                    base_score = np.dot(feature, base_mean / np.linalg.norm(base_mean))
+                    rt1_score = np.dot(feature, rt_mean / np.linalg.norm(rt_mean))
+            else:
+                # 실시간 feature가 아직 없으면 base만 사용
+                mean = base_mean
+                base_score = np.dot(feature, mean / np.linalg.norm(mean))
+
             mean = mean / np.linalg.norm(mean)
 
             score = np.dot(feature, mean)
@@ -66,14 +115,14 @@ class GlobalMemory:
                 best_score = score
                 best_id = gid
 
-        if best_score > 0.75:
+        if best_score > 0.8:
             self.real_time_data[best_id].append(feature)
             if len(self.real_time_data[best_id]) > real_time_num:
                 self.real_time_data[best_id].pop(0)
 
-            return best_id, best_score
+            return best_id, best_score, np.array([base_score, rt1_score, rt2_score])
 
-        return None, best_score
+        return None, best_score, np.array([base_score, rt1_score, rt2_score])
 
 
 # =========================
@@ -88,7 +137,7 @@ class Worker(QThread):
 
         self.cap = cv2.VideoCapture(0)
         # self.model = YOLO("yolo11n.pt")
-        self.model = YOLO("yolo11n-seg2.pt")
+        self.model = YOLO("yolo11n-seg.pt")
         self.reid = ReIDModel()
 
         self.memory = memory
@@ -100,6 +149,8 @@ class Worker(QThread):
         self.buffer = []
 
         self.mask_thres = 0.5
+
+        self.output_full = None
 
     def toggle_live(self):
         self.live_on = not self.live_on
@@ -130,6 +181,9 @@ class Worker(QThread):
             # =========================
             # UI UPDATE
             # =========================
+            # view_frame = self.output_full
+            # if view_frame is None:
+            #     view_frame = frame
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
             qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -189,19 +243,22 @@ class Worker(QThread):
 
         h, w = frame.shape[:2]
 
+        # self.real_time_seg_view(frame, masks, h, w)
+
+
         for idx, (box, mask) in enumerate(zip(boxes, masks)):
             feat = self.get_feature(frame, box, mask, h, w)
             if feat is None:
                 continue
 
-            gid, score = self.memory.match(feat)
+            gid, score, test_list = self.memory.match(feat)
 
             if gid is None:
                 color = (0, 0, 255)
-                label = f"UNKNOWN Score:{score}"
+                label = f"UNKNOWN Score:{score:.3f}. Base:{test_list[0]:.3f}, rt1:{test_list[1]:.3f}, rt2:{test_list[2]:.3f}"
             else:
                 color = (0, 255, 0)
-                label = f"GID:{gid} Score:{score}"
+                label = f"GID:{gid} Score:{score:.3f}. Base:{test_list[0]:.3f}, rt1:{test_list[1]:.3f}, rt2:{test_list[2]:.3f}"
 
             x1, y1, x2, y2 = box
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -261,6 +318,19 @@ class Worker(QThread):
         # 0~1 alpha로 변환
         alpha = mask.astype(np.float32) / 255.0
         return alpha
+
+    # def real_time_seg_view(self, frame, masks, h, w):
+    #     full_person_mask = np.zeros((h, w), dtype=np.uint8)
+    #
+    #     for mask in masks:
+    #         binary_mask = (mask > self.mask_thres).astype(np.uint8)
+    #         full_person_mask = np.maximum(full_person_mask, binary_mask)
+    #
+    #     self.output_full = self.apply_background_white(
+    #         image=frame,
+    #         person_mask=full_person_mask
+    #     )
+
 
 
 # =========================
