@@ -18,13 +18,18 @@ from torchreid.reid.utils.feature_extractor import FeatureExtractor
 class ReIDModel:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(self.device)
         # self.extractor = FeatureExtractor(
         #     model_name="osnet_ibn_x1_0",
         #     device=self.device
         # )
 
+        # self.extractor = FeatureExtractor(
+        #     model_name="osnet_ain_x1_0",
+        #     device=self.device
+        # )
         self.extractor = FeatureExtractor(
-            model_name="osnet_ain_x1_0",
+            model_name="osnet_x1_0",
             device=self.device
         )
 
@@ -32,8 +37,16 @@ class ReIDModel:
         if img is None or img.size == 0:
             return None
 
-        feat = self.extractor(img).cpu().numpy().flatten()
-        feat = feat / np.linalg.norm(feat)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        feat = self.extractor(img_rgb)
+
+        if isinstance(feat, torch.Tensor):
+            feat = feat.detach().cpu().numpy()
+
+        feat = feat.flatten().astype(np.float32)
+        feat = feat / (np.linalg.norm(feat) + 1e-12)
+
         return feat
 
 
@@ -55,7 +68,7 @@ class GlobalMemory:
         best_score = -1
 
         base_max_num = 50 # 첫 feature 데이터를 몇개을 평균 낼건지
-        real_time_num = 100  # 실시간 feature 데이터를 몇개 사용 할건지
+        real_time_num = 50  # 실시간 feature 데이터를 몇개 사용 할건지
 
         rt1_score = 0.0
         rt2_score = 0.0
@@ -77,31 +90,15 @@ class GlobalMemory:
             # 2. real-time feature 평균
             # -------------------------
             if len(self.real_time_data[gid]) > 0:
-                if len(self.real_time_data[gid]) > 1:
-                    rt_mean1 = np.mean(self.real_time_data[gid][:50], axis=0)
-                    rt_mean1 = rt_mean1 / np.linalg.norm(rt_mean1)
-
-                    rt_mean2 = np.mean(self.real_time_data[gid], axis=0)
-                    rt_mean2 = rt_mean2 / np.linalg.norm(rt_mean2)
-
-                    # 개수와 상관없이 비율로 평균 조절
-                    mean = (base_mean * 0.3) + (rt_mean1 * 0.0) + (rt_mean2 * 0.7)
-
-                    # 각 확률 시각화 해보고 싶어 이거 for문 여기서 하는게 맞나? 변수 첫 초기화 어디서 해야할까??
-                    # 와서 이거 해보면 되겠네
-                    base_score = np.dot(feature,base_mean  / np.linalg.norm(base_mean))
-                    rt1_score = np.dot(feature,rt_mean1 / np.linalg.norm(rt_mean1))
-                    rt2_score = np.dot(feature,rt_mean2 / np.linalg.norm(rt_mean2))
-
-                else:
-                    rt_mean = np.mean(self.real_time_data[gid], axis=0)
-                    rt_mean = rt_mean / np.linalg.norm(rt_mean)
-
-                    # 개수와 상관없이 비율로 평균 조절
-                    mean = (base_mean * 0.5) + (rt_mean * 0.7)
-
-                    base_score = np.dot(feature, base_mean / np.linalg.norm(base_mean))
-                    rt1_score = np.dot(feature, rt_mean / np.linalg.norm(rt_mean))
+                # rt_mean1 = np.mean(self.real_time_data[gid][:], axis=0)
+                # rt_mean1 = rt_mean1 / np.linalg.norm(rt_mean1)
+                #
+                # # 개수와 상관없이 비율로 평균 조절
+                # mean = (base_mean * 0.0) + (rt_mean1 * 1.0)
+                #
+                # base_score = np.dot(feature,base_mean  / np.linalg.norm(base_mean))
+                # rt1_score = np.dot(feature,rt_mean1 / np.linalg.norm(rt_mean1))
+                mean = self.real_time_data[gid][0]
             else:
                 # 실시간 feature가 아직 없으면 base만 사용
                 mean = base_mean
@@ -115,13 +112,24 @@ class GlobalMemory:
                 best_score = score
                 best_id = gid
 
-        if best_score > 0.8:
-            self.real_time_data[best_id].append(feature)
-            if len(self.real_time_data[best_id]) > real_time_num:
-                self.real_time_data[best_id].pop(0)
+        if best_score > 0.65:
+            if len(self.real_time_data[best_id]) == 0:
+                self.real_time_data[best_id].append(feature / np.linalg.norm(feature))
+            else:
+                smooth_alpha = 0.85
+                updated = (
+                        smooth_alpha * self.real_time_data[best_id][0]
+                        + (1.0 - smooth_alpha) * feature
+                )
+                new_realtime_feature = updated / np.linalg.norm(updated)
+                self.real_time_data[best_id][0] = new_realtime_feature
+
+            # self.real_time_data[best_id].append(feature)
+            # if len(self.real_time_data[best_id]) > real_time_num:
+            #     self.real_time_data[best_id].pop(0)
 
             return best_id, best_score, np.array([base_score, rt1_score, rt2_score])
-
+        print("UNKNOWN")
         return None, best_score, np.array([base_score, rt1_score, rt2_score])
 
 
@@ -197,7 +205,7 @@ class Worker(QThread):
         # if len(self.buffer) == 0:
         self.status_signal.emit(f"Capturing ID {self.target_id}...  {len(self.buffer)}/100")
 
-        results = self.model(frame, classes=[0], verbose=False, retina_masks=True)[0]
+        results = self.model(frame, classes=[0], conf=0.5, verbose=False, retina_masks=True)[0]
 
         if results.boxes is None or results.masks is None:
             return
@@ -300,6 +308,7 @@ class Worker(QThread):
         output = np.clip(output, 0, 255).astype(np.uint8)
 
         return output
+
 
     def smooth_mask(self, binary_mask, blur_size=21):
         """
@@ -425,7 +434,6 @@ class MainWindow(QMainWindow):
     # FEATURE CAPTURE
     # =========================
     def start_capture(self):
-
         if self.selected_id is None:
             self.status.setText("Select ID first!")
             return
