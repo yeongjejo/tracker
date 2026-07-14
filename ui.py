@@ -40,11 +40,8 @@ class ReIDModel:
             (
                 "TensorrtExecutionProvider",
                 {
-                    # 생성된 TensorRT 엔진을 디스크에 캐시
                     "trt_engine_cache_enable": True,
                     "trt_engine_cache_path": engine_cache_dir,
-
-                    # FP16 TensorRT 엔진 사용
                     "trt_fp16_enable": True,
                 }
             ),
@@ -110,29 +107,60 @@ class ReIDModel:
         )
 
     def extract(self, img_bgr):
-        input_tensor = self.preprocess(img_bgr)
+        features = self.extract_batch([img_bgr])
 
-        if input_tensor is None:
+        if len(features) == 0:
             return None
 
-        outputs = self.session.run(
+        return features[0]
+
+    def extract_batch(self, images_bgr):
+        tensors = []
+
+        for image in images_bgr:
+            tensor = self.preprocess(image)
+
+            if tensor is not None:
+                # preprocess 결과: [1, 3, 256, 128]
+                # 배치 결합을 위해 첫 번째 축 제거
+                tensors.append(tensor[0])
+
+        if not tensors:
+            return np.empty((0, 512), dtype=np.float32)
+
+        # [N, 3, 256, 128]
+        batch = np.stack(
+            tensors,
+            axis=0
+        ).astype(np.float32)
+
+        batch = np.ascontiguousarray(batch)
+
+        features = self.session.run(
             [self.output_name],
             {
-                self.input_name: input_tensor
+                self.input_name: batch
             }
+        )[0]
+
+        features = np.asarray(
+            features,
+            dtype=np.float32
         )
 
-        feature = np.asarray(
-            outputs[0],
-            dtype=np.float32
-        ).reshape(-1)
+        # 혹시 출력이 [N, 512, 1, 1] 형태인 경우 대비
+        features = features.reshape(features.shape[0], -1)
 
-        norm = np.linalg.norm(feature)
+        # 각 Feature L2 정규화
+        norms = np.linalg.norm(
+            features,
+            axis=1,
+            keepdims=True
+        )
 
-        if norm > 1e-12:
-            feature = feature / norm
+        features = features / np.maximum(norms, 1e-12)
 
-        return feature
+        return features
 
 
 # =========================
@@ -379,7 +407,7 @@ class Worker(QThread):
             if not ret:
                 continue
 
-            # frame = cv2.resize(frame, (960, 540))
+            frame = cv2.resize(frame, (960, 540))
 
             # =========================
             # FPS
@@ -511,48 +539,107 @@ class Worker(QThread):
             )
             return
 
+
         boxes = results.boxes.xyxy.cpu().numpy().astype(int)
         masks = results.masks.data.cpu().numpy()
 
         h, w = frame.shape[:2]
 
-        # self.real_time_seg_view(frame, masks, h, w)
-        total_osnet_ms = 0.0
-        total_match_ms = 0.0
-        for idx, (box, mask) in enumerate(zip(boxes, masks)):
-            # =========================
-            # 2. Crop + OSNet 처리 시간
-            # =========================
-            osnet_start = time.perf_counter()
+        # =========================
+        # 2. 유효한 Crop과 Box 수집
+        # =========================
+        reid_crops = []
+        valid_boxes = []
 
-            feat = self.get_feature(frame, box, mask, h, w)
+        crop_start = time.perf_counter()
 
-            osnet_ms = (time.perf_counter() - osnet_start) * 1000.0
-            total_osnet_ms += osnet_ms
-            if feat is None:
+        for box, mask in zip(boxes, masks):
+            crop = self.get_reid_crop(
+                frame=frame,
+                box=box,
+                mask=mask,
+                h=h,
+                w=w
+            )
+
+            if crop is None:
                 continue
 
-            # =========================
-            # 3. Feature 매칭 시간
-            # =========================
+            reid_crops.append(crop)
+            valid_boxes.append(box)
+
+        crop_ms = (time.perf_counter() - crop_start) * 1000.0
+
+        # =========================
+        # 3. OSNet Batch 추론
+        # =========================
+        if reid_crops:
+            osnet_start = time.perf_counter()
+            features = self.reid.extract_batch(reid_crops)
+            osnet_inference_ms = (time.perf_counter() - osnet_start) * 1000.0
+        else:
+            features = np.empty(
+                (0, 512),
+                dtype=np.float32
+            )
+            osnet_inference_ms = 0.0
+
+
+        total_osnet_ms = crop_ms + osnet_inference_ms
+
+        # =========================
+        # 4. Feature Matching
+        # =========================
+        total_match_ms = 0.0
+
+        for box, feature in zip(valid_boxes, features):
             match_start = time.perf_counter()
 
-            gid, score, test_list = self.memory.match(feat)
+            gid, score, test_list = self.memory.match(feature)
 
             match_ms = (time.perf_counter() - match_start) * 1000.0
+
             total_match_ms += match_ms
 
             if gid is None:
                 color = (0, 0, 255)
-                label = f"UNKNOWN Score:{score:.3f}. Base:{test_list[0]:.3f}, rt1:{test_list[1]:.3f}, rt2:{test_list[2]:.3f}"
+
+                label = (
+                    f"UNKNOWN Score:{score:.3f}. "
+                    f"Base:{test_list[0]:.3f}, "
+                    f"rt1:{test_list[1]:.3f}, "
+                    f"rt2:{test_list[2]:.3f}"
+                )
             else:
                 color = (0, 255, 0)
-                label = f"GID:{gid} Score:{score:.3f}. Base:{test_list[0]:.3f}, rt1:{test_list[1]:.3f}, rt2:{test_list[2]:.3f}"
 
-            x1, y1, x2, y2 = box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                label = (
+                    f"GID:{gid} Score:{score:.3f}. "
+                    f"Base:{test_list[0]:.3f}, "
+                    f"rt1:{test_list[1]:.3f}, "
+                    f"rt2:{test_list[2]:.3f}"
+                )
+
+            x1, y1, x2, y2 = map(int, box)
+
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                color,
+                2
+            )
+
+            cv2.putText(
+                frame,
+                label,
+                (x1, max(20, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                cv2.LINE_AA
+            )
 
         total_ms = (time.perf_counter() - total_start) * 1000.0
 
@@ -584,6 +671,55 @@ class Worker(QThread):
         feat = self.reid.extract(output_crop)
 
         return feat
+
+    def get_reid_crop(self, frame, box, mask, h, w):
+        x1, y1, x2, y2 = map(int, box)
+
+        # 좌표 범위 제한
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2]
+
+        if crop is None or crop.size == 0:
+            return None
+
+        # retina_masks=True이면 보통 frame과 같은 크기지만
+        # 크기가 다른 경우 원본 크기로 보정
+        if mask.shape[:2] != (h, w):
+            mask = cv2.resize(
+                mask,
+                (w, h),
+                interpolation=cv2.INTER_LINEAR
+            )
+
+        crop_mask = mask[y1:y2, x1:x2]
+
+        if crop_mask is None or crop_mask.size == 0:
+            return None
+
+        if crop_mask.shape[:2] != crop.shape[:2]:
+            crop_mask = cv2.resize(
+                crop_mask,
+                (crop.shape[1], crop.shape[0]),
+                interpolation=cv2.INTER_LINEAR
+            )
+
+        crop_mask = (
+                crop_mask > self.mask_thres
+        ).astype(np.uint8)
+
+        output_crop = self.apply_background_white(
+            image=crop,
+            person_mask=crop_mask
+        )
+
+        return output_crop
 
 
     def apply_background_white(self, image, person_mask):
