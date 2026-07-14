@@ -180,7 +180,10 @@ class Worker(QThread):
 
         self.cap = cv2.VideoCapture(0)
         # self.model = YOLO("yolo11n.pt")
-        self.model = YOLO("yolo11n-seg.pt")
+        # self.model = YOLO("yolo11n-seg.pt")
+        # self.model = YOLO("yolo26n-seg.pt")
+        self.model = YOLO("yolo26n-seg.engine")
+
         self.reid = ReIDModel()
 
         self.memory = memory
@@ -292,7 +295,7 @@ class Worker(QThread):
             if not ret:
                 continue
 
-            frame = cv2.resize(frame, (960, 540))
+            # frame = cv2.resize(frame, (960, 540))
 
             # =========================
             # FPS
@@ -332,6 +335,11 @@ class Worker(QThread):
             # =========================
             # UI UPDATE
             # =========================
+            # view_frame = cv2.resize(
+            #     frame,
+            #     (960, 540)
+            # )
+
             # view_frame = self.output_full
             # if view_frame is None:
             #     view_frame = frame
@@ -349,7 +357,14 @@ class Worker(QThread):
         # if len(self.buffer) == 0:
         self.status_signal.emit(f"Capturing ID {self.target_id}...  {len(self.buffer)}/100")
 
-        results = self.model(frame, classes=[0], conf=0.5, verbose=False, retina_masks=True)[0]
+        results = self.model(
+            frame,
+            classes=[0],
+            conf=0.5,
+            imgsz=416,
+            verbose=False,
+            retina_masks=True
+        )[0]
 
         if results.boxes is None or results.masks is None:
             return
@@ -391,7 +406,14 @@ class Worker(QThread):
         # =========================
         yolo_start = time.perf_counter()
 
-        results = self.model(frame, classes=[0], verbose=False, retina_masks=True)[0]
+        results = self.model(
+            frame,
+            classes=[0],
+            conf=0.5,
+            imgsz=416,
+            verbose=False,
+            retina_masks=True
+        )[0]
 
         yolo_ms = (time.perf_counter() - yolo_start) * 1000.0
 
@@ -420,6 +442,9 @@ class Worker(QThread):
             osnet_start = time.perf_counter()
 
             feat = self.get_feature(frame, box, mask, h, w)
+
+            osnet_ms = (time.perf_counter() - osnet_start) * 1000.0
+            total_osnet_ms += osnet_ms
             if feat is None:
                 continue
 
