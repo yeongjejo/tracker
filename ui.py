@@ -3,6 +3,7 @@ import sys
 import cv2
 import numpy as np
 import torch
+import time
 
 from ultralytics import YOLO
 from PySide6.QtWidgets import *
@@ -57,6 +58,7 @@ class GlobalMemory:
     def __init__(self):
         self.base_data = {}  # id -> mean feature
         self.real_time_data = {i: [] for i in range(8)}  # id -> mean feature
+        self.unknown_data = {}  # id -> mean feature
 
     def add(self, gid, features):
         # mean = np.mean(features, axis=0)
@@ -112,7 +114,7 @@ class GlobalMemory:
                 best_score = score
                 best_id = gid
 
-        if best_score > 0.65:
+        if best_score > 0.75:
             if len(self.real_time_data[best_id]) == 0:
                 self.real_time_data[best_id].append(feature / np.linalg.norm(feature))
             else:
@@ -130,8 +132,41 @@ class GlobalMemory:
 
             return best_id, best_score, np.array([base_score, rt1_score, rt2_score])
         print("UNKNOWN")
-        return None, best_score, np.array([base_score, rt1_score, rt2_score])
 
+        # UNKNOWN
+        if len(self.unknown_data.keys()) == 0:
+            num = random.randint(0, 9999)
+            self.unknown_data[num] = [feature, 1]
+        else:
+            best_id = None
+            best_score = -1
+            for gid, value in self.unknown_data.items():
+                un_feature = value[0].copy()
+                un_feature = un_feature / np.linalg.norm(un_feature)
+                score = np.dot(feature, un_feature)
+
+                if score > best_score:
+                    best_score = score
+                    best_id = gid
+
+            if best_score > 0.75:
+                smooth_alpha = 0.85
+                updated = (
+                        smooth_alpha * self.unknown_data[best_id][0]
+                        + (1.0 - smooth_alpha) * feature
+                )
+                new_realtime_feature = updated / np.linalg.norm(updated)
+                self.unknown_data[best_id][0] = new_realtime_feature
+                self.unknown_data[best_id][1] += 1
+            else:
+                num = random.randint(0, 9999)
+                if num not in self.unknown_data.keys():
+                    self.unknown_data[num] = [feature, 1]
+
+
+
+
+        return None, best_score, np.array([base_score, rt1_score, rt2_score])
 
 # =========================
 # WORKER THREAD
@@ -159,6 +194,88 @@ class Worker(QThread):
         self.mask_thres = 0.5
 
         self.output_full = None
+        self.prev_time = time.perf_counter()
+        self.fps = 0.0
+
+        self.time_yolo = 0.0
+        self.time_osnet = 0.0
+        self.time_match = 0.0
+        self.time_total = 0.0
+        self.processing_fps = 0.0
+
+    def draw_processing_time(
+            self,
+            frame,
+            yolo_ms,
+            osnet_ms,
+            match_ms,
+            total_ms
+    ):
+        smooth_alpha = 0.9
+
+        if self.time_total == 0.0:
+            self.time_yolo = yolo_ms
+            self.time_osnet = osnet_ms
+            self.time_match = match_ms
+            self.time_total = total_ms
+        else:
+            self.time_yolo = (
+                    smooth_alpha * self.time_yolo
+                    + (1.0 - smooth_alpha) * yolo_ms
+            )
+
+            self.time_osnet = (
+                    smooth_alpha * self.time_osnet
+                    + (1.0 - smooth_alpha) * osnet_ms
+            )
+
+            self.time_match = (
+                    smooth_alpha * self.time_match
+                    + (1.0 - smooth_alpha) * match_ms
+            )
+
+            self.time_total = (
+                    smooth_alpha * self.time_total
+                    + (1.0 - smooth_alpha) * total_ms
+            )
+
+        if self.time_total > 0:
+            self.processing_fps = 1000.0 / self.time_total
+        else:
+            self.processing_fps = 0.0
+
+        lines = [
+            f"YOLO   : {self.time_yolo:.2f} ms",
+            f"OSNet  : {self.time_osnet:.2f} ms",
+            f"Match  : {self.time_match:.2f} ms",
+            f"Total  : {self.time_total:.2f} ms",
+            f"FPS    : {self.processing_fps:.1f}",
+        ]
+
+        x = 15
+        y = 30
+        line_height = 28
+
+        # 글자 배경
+        cv2.rectangle(
+            frame,
+            (5, 5),
+            (270, 155),
+            (0, 0, 0),
+            -1
+        )
+
+        for index, text in enumerate(lines):
+            cv2.putText(
+                frame,
+                text,
+                (x, y + index * line_height),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
 
     def toggle_live(self):
         self.live_on = not self.live_on
@@ -178,6 +295,32 @@ class Worker(QThread):
             frame = cv2.resize(frame, (960, 540))
 
             # =========================
+            # FPS
+            # =========================
+            now = time.perf_counter()
+            dt = now - self.prev_time
+            self.prev_time = now
+
+            if dt > 0:
+                current_fps = 1.0 / dt
+
+                # EMA 방식으로 부드럽게
+                if self.fps == 0:
+                    self.fps = current_fps
+                else:
+                    self.fps = self.fps * 0.9 + current_fps * 0.1
+
+            cv2.putText(
+                frame,
+                f"FPS : {self.fps:.1f}",
+                (15, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                2,
+            )
+
+            # =========================
             # MODE ROUTING
             # =========================
             if self.mode == "capture":
@@ -195,6 +338,7 @@ class Worker(QThread):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
             qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+
 
             self.update_frame.emit(qimg)
 
@@ -240,10 +384,25 @@ class Worker(QThread):
     # LIVE MODE
     # =========================
     def live(self, frame):
+        total_start = time.perf_counter()
+
+        # =========================
+        # 1. YOLO 처리 시간
+        # =========================
+        yolo_start = time.perf_counter()
 
         results = self.model(frame, classes=[0], verbose=False, retina_masks=True)[0]
 
+        yolo_ms = (time.perf_counter() - yolo_start) * 1000.0
+
         if results.boxes is None or results.masks is None:
+            self.draw_processing_time(
+                frame=frame,
+                yolo_ms=yolo_ms,
+                osnet_ms=0.0,
+                match_ms=0.0,
+                total_ms=(time.perf_counter() - total_start) * 1000.0
+            )
             return
 
         boxes = results.boxes.xyxy.cpu().numpy().astype(int)
@@ -252,14 +411,27 @@ class Worker(QThread):
         h, w = frame.shape[:2]
 
         # self.real_time_seg_view(frame, masks, h, w)
-
-
+        total_osnet_ms = 0.0
+        total_match_ms = 0.0
         for idx, (box, mask) in enumerate(zip(boxes, masks)):
+            # =========================
+            # 2. Crop + OSNet 처리 시간
+            # =========================
+            osnet_start = time.perf_counter()
+
             feat = self.get_feature(frame, box, mask, h, w)
             if feat is None:
                 continue
 
+            # =========================
+            # 3. Feature 매칭 시간
+            # =========================
+            match_start = time.perf_counter()
+
             gid, score, test_list = self.memory.match(feat)
+
+            match_ms = (time.perf_counter() - match_start) * 1000.0
+            total_match_ms += match_ms
 
             if gid is None:
                 color = (0, 0, 255)
@@ -272,6 +444,16 @@ class Worker(QThread):
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, label, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        total_ms = (time.perf_counter() - total_start) * 1000.0
+
+        self.draw_processing_time(
+            frame=frame,
+            yolo_ms=yolo_ms,
+            osnet_ms=total_osnet_ms,
+            match_ms=total_match_ms,
+            total_ms=total_ms
+        )
 
 
     def get_feature(self, frame, box, mask, h, w):
@@ -490,3 +672,18 @@ app = QApplication(sys.argv)
 window = MainWindow()
 window.show()
 sys.exit(app.exec())
+
+
+
+
+
+
+
+
+
+
+# 출근하면
+# osnet 시간 2줄 추가해야하는거하고
+# yolo26으로 변경 고려해보고
+# 언노운 코드 마무리하고
+#
