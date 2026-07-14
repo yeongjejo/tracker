@@ -10,6 +10,10 @@ from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
 
+import os
+from pathlib import Path
+import onnxruntime as ort
+
 from torchreid.reid.utils.feature_extractor import FeatureExtractor
 
 
@@ -17,38 +21,118 @@ from torchreid.reid.utils.feature_extractor import FeatureExtractor
 # REID MODEL
 # =========================
 class ReIDModel:
-    def __init__(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(self.device)
-        # self.extractor = FeatureExtractor(
-        #     model_name="osnet_ibn_x1_0",
-        #     device=self.device
-        # )
+    def __init__(self, model_path="osnet_x1_0.onnx", engine_cache_dir="./osnet_trt_cache"):
+        model_path = str(Path(model_path).resolve())
+        engine_cache_dir = str(Path(engine_cache_dir).resolve())
 
-        # self.extractor = FeatureExtractor(
-        #     model_name="osnet_ain_x1_0",
-        #     device=self.device
-        # )
-        self.extractor = FeatureExtractor(
-            model_name="osnet_x1_0",
-            device=self.device
+        os.makedirs(engine_cache_dir, exist_ok=True)
+
+        available_providers = ort.get_available_providers()
+        print("Available providers:", available_providers)
+
+        if "TensorrtExecutionProvider" not in available_providers:
+            raise RuntimeError(
+                "TensorrtExecutionProvider를 사용할 수 없습니다. "
+                "onnxruntime-gpu, CUDA 및 TensorRT 설치 상태를 확인하세요."
+            )
+
+        providers = [
+            (
+                "TensorrtExecutionProvider",
+                {
+                    # 생성된 TensorRT 엔진을 디스크에 캐시
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": engine_cache_dir,
+
+                    # FP16 TensorRT 엔진 사용
+                    "trt_fp16_enable": True,
+                }
+            ),
+            (
+                "CUDAExecutionProvider",
+                {
+                    "device_id": 0
+                }
+            ),
+            "CPUExecutionProvider"
+        ]
+
+        self.session = ort.InferenceSession(
+            model_path,
+            providers=providers
         )
 
-    def extract(self, img):
-        if img is None or img.size == 0:
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+
+        print("OSNet providers:", self.session.get_providers())
+        print("OSNet input:", self.input_name)
+        print("OSNet output:", self.output_name)
+
+    def preprocess(self, img_bgr):
+        if img_bgr is None or img_bgr.size == 0:
             return None
 
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # OpenCV BGR → RGB
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        feat = self.extractor(img_rgb)
+        # OSNet 입력: width=128, height=256
+        img_rgb = cv2.resize(
+            img_rgb,
+            (128, 256),
+            interpolation=cv2.INTER_LINEAR
+        )
 
-        if isinstance(feat, torch.Tensor):
-            feat = feat.detach().cpu().numpy()
+        image = img_rgb.astype(np.float32) / 255.0
 
-        feat = feat.flatten().astype(np.float32)
-        feat = feat / (np.linalg.norm(feat) + 1e-12)
+        # Torchreid 기본 ImageNet 정규화
+        mean = np.array(
+            [0.485, 0.456, 0.406],
+            dtype=np.float32
+        )
 
-        return feat
+        std = np.array(
+            [0.229, 0.224, 0.225],
+            dtype=np.float32
+        )
+
+        image = (image - mean) / std
+
+        # HWC → CHW
+        image = image.transpose(2, 0, 1)
+
+        # CHW → NCHW
+        image = np.expand_dims(image, axis=0)
+
+        return np.ascontiguousarray(
+            image,
+            dtype=np.float32
+        )
+
+    def extract(self, img_bgr):
+        input_tensor = self.preprocess(img_bgr)
+
+        if input_tensor is None:
+            return None
+
+        outputs = self.session.run(
+            [self.output_name],
+            {
+                self.input_name: input_tensor
+            }
+        )
+
+        feature = np.asarray(
+            outputs[0],
+            dtype=np.float32
+        ).reshape(-1)
+
+        norm = np.linalg.norm(feature)
+
+        if norm > 1e-12:
+            feature = feature / norm
+
+        return feature
 
 
 # =========================
