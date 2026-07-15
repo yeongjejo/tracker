@@ -181,8 +181,18 @@ class GlobalMemory:
                 self.real_time_count[id] -= 1
                 if self.real_time_count[id] == 0:
                     self.real_time_data[id] = []
+                    print("실시간 feature 정리 : ", id)
             else:
                 self.real_time_count[id] = 100
+
+    # unknown_data 정리
+    def subtract_unknown_data_cont(self):
+        for key, value in list(self.unknown_data.items()):
+            if value[1] == 0:
+                print("unknown_data 정리")
+                del self.unknown_data[key]
+            else:
+                self.unknown_data[key][1] -= 1
 
 
 
@@ -194,6 +204,28 @@ class GlobalMemory:
     def match(self, feature):
         best_id = None
         best_score = -1
+
+        un_best_id = None
+        un_best_score = 0
+        for gid, value in self.unknown_data.items():
+            un_feature = value[0].copy()
+            un_feature = un_feature / np.linalg.norm(un_feature)
+            score = np.dot(feature, un_feature)
+
+            if score > un_best_score:
+                un_best_score = score
+                un_best_id = gid
+
+        if un_best_score > 0.75:
+            smooth_alpha = 0.85
+            updated = (
+                    smooth_alpha * self.unknown_data[un_best_id][0]
+                    + (1.0 - smooth_alpha) * feature
+            )
+            new_realtime_feature = updated / np.linalg.norm(updated)
+            self.unknown_data[un_best_id][0] = new_realtime_feature
+
+
 
         base_max_num = 50 # 첫 feature 데이터를 몇개을 평균 낼건지
         for gid, base_features in self.base_data.items():
@@ -224,7 +256,6 @@ class GlobalMemory:
             else:
                 # 실시간 feature가 아직 없으면 base만 사용
                 mean = base_mean
-                base_score = np.dot(feature, mean / np.linalg.norm(mean))
 
             mean = mean / np.linalg.norm(mean)
 
@@ -234,7 +265,7 @@ class GlobalMemory:
                 best_score = score
                 best_id = gid
 
-        if best_score > 0.75:
+        if best_score > 0.75 and best_score > un_best_score:
             if len(self.real_time_data[best_id]) == 0:
                 self.real_time_data[best_id].append(feature / np.linalg.norm(feature))
             else:
@@ -251,34 +282,13 @@ class GlobalMemory:
             #     self.real_time_data[best_id].pop(0)
 
             return best_id, best_score
-        print("UNKNOWN")
 
         # UNKNOWN
         if len(self.unknown_data.keys()) == 0:
             num = random.randint(0, 9999)
             self.unknown_data[num] = [feature, 30]
         else:
-            best_id = None
-            best_score = -1
-            for gid, value in self.unknown_data.items():
-                un_feature = value[0].copy()
-                un_feature = un_feature / np.linalg.norm(un_feature)
-                score = np.dot(feature, un_feature)
-
-                if score > best_score:
-                    best_score = score
-                    best_id = gid
-
-            if best_score > 0.75:
-                smooth_alpha = 0.85
-                updated = (
-                        smooth_alpha * self.unknown_data[best_id][0]
-                        + (1.0 - smooth_alpha) * feature
-                )
-                new_realtime_feature = updated / np.linalg.norm(updated)
-                self.unknown_data[best_id][0] = new_realtime_feature
-                self.unknown_data[best_id][1] = 30
-            else:
+            if un_best_score <= 0.75:
                 while True:
                     num = random.randint(0, 9999)
                     if num not in self.unknown_data.keys():
@@ -650,7 +660,9 @@ class Worker(QThread):
 
             id_list.append(gid)
 
+        # 실시간 저장 feature정리
         self.memory.subtract_real_time_cont(id_list)
+        self.memory.subtract_unknown_data_cont()
 
 
         total_ms = (time.perf_counter() - total_start) * 1000.0
