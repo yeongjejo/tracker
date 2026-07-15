@@ -171,6 +171,20 @@ class GlobalMemory:
         self.base_data = {}  # id -> mean feature
         self.real_time_data = {i: [] for i in range(8)}  # id -> mean feature
         self.unknown_data = {}  # id -> mean feature
+        self.real_time_count = [100 for _ in range(8)]
+
+    # 실시간 feature 정리
+    def subtract_real_time_cont(self, id_list):
+        all_id = [i for i in range(8)]
+        for id in all_id:
+            if id not in id_list:
+                self.real_time_count[id] -= 1
+                if self.real_time_count[id] == 0:
+                    self.real_time_data[id] = []
+            else:
+                self.real_time_count[id] = 100
+
+
 
     def add(self, gid, features):
         # mean = np.mean(features, axis=0)
@@ -182,20 +196,15 @@ class GlobalMemory:
         best_score = -1
 
         base_max_num = 50 # 첫 feature 데이터를 몇개을 평균 낼건지
-        real_time_num = 50  # 실시간 feature 데이터를 몇개 사용 할건지
-
-        rt1_score = 0.0
-        rt2_score = 0.0
-        base_score = 0.0
         for gid, base_features in self.base_data.items():
             # -------------------------
             # 1. base feature 평균
             # -------------------------
             # 50개 랜덤 샘플로 사용할경우
-            base_sample_num = min(base_max_num, len(base_features))
-            base_sample = random.sample(base_features, base_sample_num)
+            # base_sample_num = min(base_max_num, len(base_features))
+            # base_sample = random.sample(base_features, base_sample_num)
             # 그냥 100개 전부 사용할 경우
-            # base_sample = base_features
+            base_sample = base_features
 
             base_mean = np.mean(base_sample, axis=0)
             base_mean = base_mean / np.linalg.norm(base_mean)
@@ -208,11 +217,10 @@ class GlobalMemory:
                 # rt_mean1 = rt_mean1 / np.linalg.norm(rt_mean1)
                 #
                 # # 개수와 상관없이 비율로 평균 조절
-                # mean = (base_mean * 0.0) + (rt_mean1 * 1.0)
-                #
-                # base_score = np.dot(feature,base_mean  / np.linalg.norm(base_mean))
-                # rt1_score = np.dot(feature,rt_mean1 / np.linalg.norm(rt_mean1))
-                mean = self.real_time_data[gid][0]
+                real_time_rate = 0.8 * (self.real_time_count[gid] / 100.0)
+                base_rate = 1.0 - real_time_rate
+                mean = (base_mean * base_rate) + (self.real_time_data[gid][0] * real_time_rate)
+                # mean = self.real_time_data[gid][0]
             else:
                 # 실시간 feature가 아직 없으면 base만 사용
                 mean = base_mean
@@ -242,13 +250,13 @@ class GlobalMemory:
             # if len(self.real_time_data[best_id]) > real_time_num:
             #     self.real_time_data[best_id].pop(0)
 
-            return best_id, best_score, np.array([base_score, rt1_score, rt2_score])
+            return best_id, best_score
         print("UNKNOWN")
 
         # UNKNOWN
         if len(self.unknown_data.keys()) == 0:
             num = random.randint(0, 9999)
-            self.unknown_data[num] = [feature, 1]
+            self.unknown_data[num] = [feature, 30]
         else:
             best_id = None
             best_score = -1
@@ -269,16 +277,15 @@ class GlobalMemory:
                 )
                 new_realtime_feature = updated / np.linalg.norm(updated)
                 self.unknown_data[best_id][0] = new_realtime_feature
-                self.unknown_data[best_id][1] += 1
+                self.unknown_data[best_id][1] = 30
             else:
-                num = random.randint(0, 9999)
-                if num not in self.unknown_data.keys():
-                    self.unknown_data[num] = [feature, 1]
+                while True:
+                    num = random.randint(0, 9999)
+                    if num not in self.unknown_data.keys():
+                        self.unknown_data[num] = [feature, 30]
+                        break
 
-
-
-
-        return None, best_score, np.array([base_score, rt1_score, rt2_score])
+        return None, None
 
 # =========================
 # WORKER THREAD
@@ -317,6 +324,17 @@ class Worker(QThread):
         self.time_match = 0.0
         self.time_total = 0.0
         self.processing_fps = 0.0
+
+        self.id_color = [
+            (230, 159, 0),
+            (86, 180, 233),
+            (0, 158, 115),
+            (240, 228, 66),
+            (0, 114, 178),
+            (213, 94, 0),
+            (204, 121, 167),
+            (0, 0, 0),
+        ]
 
     def draw_processing_time(
             self,
@@ -592,54 +610,48 @@ class Worker(QThread):
         # =========================
         total_match_ms = 0.0
 
+
+        re_id = {} # 중복 탐지 방지용
+
         for box, feature in zip(valid_boxes, features):
             match_start = time.perf_counter()
 
-            gid, score, test_list = self.memory.match(feature)
+            gid, score = self.memory.match(feature)
+
 
             match_ms = (time.perf_counter() - match_start) * 1000.0
-
             total_match_ms += match_ms
 
             if gid is None:
                 color = (0, 0, 255)
-
-                label = (
-                    f"UNKNOWN Score:{score:.3f}. "
-                    f"Base:{test_list[0]:.3f}, "
-                    f"rt1:{test_list[1]:.3f}, "
-                    f"rt2:{test_list[2]:.3f}"
-                )
+                label = ( f"UNKNOWN!!! ")
+                self.draw_bounding_box(color, label, frame, box)
             else:
-                color = (0, 255, 0)
+                if gid in re_id:
+                    if re_id[gid][0] < score:
+                        color = (255, 255, 255)
+                        label = (f"Mismatching!! ")
+                        self.draw_bounding_box(color, label, frame, re_id[gid][1])
 
-                label = (
-                    f"GID:{gid} Score:{score:.3f}. "
-                    f"Base:{test_list[0]:.3f}, "
-                    f"rt1:{test_list[1]:.3f}, "
-                    f"rt2:{test_list[2]:.3f}"
-                )
+                        re_id[gid] = [score, box]
+                    else:
+                        color = (255, 255, 255)
+                        label = (f"Mismatching!! ")
+                        self.draw_bounding_box(color, label, frame, box)
+                else:
+                    re_id[gid] = [score, box]
 
-            x1, y1, x2, y2 = map(int, box)
+        id_list = []
+        for gid, value in re_id.items():
+            score, box = value
+            color = self.id_color[gid]
+            label = (f"GID:{gid} Score:{score:.3f}. ")
+            self.draw_bounding_box(color, label, frame, box)
 
-            cv2.rectangle(
-                frame,
-                (x1, y1),
-                (x2, y2),
-                color,
-                2
-            )
+            id_list.append(gid)
 
-            cv2.putText(
-                frame,
-                label,
-                (x1, max(20, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                cv2.LINE_AA
-            )
+        self.memory.subtract_real_time_cont(id_list)
+
 
         total_ms = (time.perf_counter() - total_start) * 1000.0
 
@@ -651,6 +663,26 @@ class Worker(QThread):
             total_ms=total_ms
         )
 
+    def draw_bounding_box(self, color, label, frame, box):
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            color,
+            2
+        )
+
+        cv2.putText(
+            frame,
+            label,
+            (x1, max(20, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+            cv2.LINE_AA
+        )
 
     def get_feature(self, frame, box, mask, h, w):
         x1, y1, x2, y2 = map(int, box)
@@ -917,18 +949,3 @@ app = QApplication(sys.argv)
 window = MainWindow()
 window.show()
 sys.exit(app.exec())
-
-
-
-
-
-
-
-
-
-
-# 출근하면
-# osnet 시간 2줄 추가해야하는거하고
-# yolo26으로 변경 고려해보고
-# 언노운 코드 마무리하고
-#
