@@ -179,21 +179,20 @@ class GlobalMemory:
 
         # UI의 저장/불러오기와 Worker의 매칭이 동시에 접근할 수 있으므로 보호합니다.
         self.data_lock = threading.RLock()
-
+        
+        # 실시간 feature 정리
     def subtract_real_time_cont(self, id_list):
         with self.data_lock:
-            for gid in range(8):
-                if gid not in id_list:
-                    self.real_time_count[gid] = max(
-                        0,
-                        self.real_time_count[gid] - 1
-                    )
-
-                    if self.real_time_count[gid] == 0:
-                        self.real_time_data[gid] = []
-                        print("실시간 feature 정리 : ", gid)
+            all_id = [i for i in range(8)]
+            for id in all_id:
+                if id not in id_list:
+                    self.real_time_count[id] -= 1
+                    if self.real_time_count[id] == 0:
+                        self.real_time_data[id] = []
+                        print("실시간 feature 정리 : ", id)
                 else:
-                    self.real_time_count[gid] = 100
+                    self.real_time_count[id] = 100
+
 
     def subtract_unknown_data_cont(self):
         with self.data_lock:
@@ -315,7 +314,7 @@ class GlobalMemory:
                 un_best_score = score
                 un_best_id = gid
 
-        if un_best_score > 0.75 and un_best_id is not None:
+        if un_best_score > 0.8 and un_best_id is not None:
             smooth_alpha = 0.85
             updated = (
                 smooth_alpha * self.unknown_data[un_best_id][0]
@@ -335,7 +334,7 @@ class GlobalMemory:
             )
 
             if len(self.real_time_data[gid]) > 0:
-                real_time_rate = 0.8 * (
+                real_time_rate = 0.5 * (
                     self.real_time_count[gid] / 100.0
                 )
                 base_rate = 1.0 - real_time_rate
@@ -355,7 +354,7 @@ class GlobalMemory:
 
         if (
             best_id is not None
-            and best_score > 0.75
+            and best_score > 0.8
             and best_score > un_best_score
         ):
             if len(self.real_time_data[best_id]) == 0:
@@ -379,7 +378,7 @@ class GlobalMemory:
         if len(self.unknown_data) == 0:
             num = random.randint(0, 9999)
             self.unknown_data[num] = [feature.copy(), 30]
-        elif un_best_score <= 0.75:
+        elif un_best_score <= 0.8:
             while True:
                 num = random.randint(0, 9999)
                 if num not in self.unknown_data:
