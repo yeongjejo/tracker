@@ -314,18 +314,6 @@ class GlobalMemory:
                 un_best_score = score
                 un_best_id = gid
 
-        if un_best_score > 0.8 and un_best_id is not None:
-            smooth_alpha = 0.85
-            updated = (
-                smooth_alpha * self.unknown_data[un_best_id][0]
-                + (1.0 - smooth_alpha) * feature
-            )
-            new_realtime_feature = updated / max(
-                np.linalg.norm(updated),
-                1e-12
-            )
-            self.unknown_data[un_best_id][0] = new_realtime_feature
-
         for gid, base_features in self.base_data.items():
             base_mean = np.mean(base_features, axis=0)
             base_mean = base_mean / max(
@@ -334,9 +322,7 @@ class GlobalMemory:
             )
 
             if len(self.real_time_data[gid]) > 0:
-                real_time_rate = 0.5 * (
-                    self.real_time_count[gid] / 100.0
-                )
+                real_time_rate = 0.5 * (self.real_time_count[gid] / 100.0)
                 base_rate = 1.0 - real_time_rate
                 mean = (
                     base_mean * base_rate
@@ -375,10 +361,23 @@ class GlobalMemory:
 
             return best_id, best_score
 
+
+        # 언노운
         if len(self.unknown_data) == 0:
             num = random.randint(0, 9999)
             self.unknown_data[num] = [feature.copy(), 30]
-        elif un_best_score <= 0.8:
+        elif un_best_score > 0.8 and un_best_id is not None:
+            smooth_alpha = 0.85
+            updated = (
+                smooth_alpha * self.unknown_data[un_best_id][0]
+                + (1.0 - smooth_alpha) * feature
+            )
+            new_realtime_feature = updated / max(
+                np.linalg.norm(updated),
+                1e-12
+            )
+            self.unknown_data[un_best_id][0] = new_realtime_feature
+        elif un_best_id is not None:
             while True:
                 num = random.randint(0, 9999)
                 if num not in self.unknown_data:
@@ -440,14 +439,25 @@ class Worker(QThread):
         self.time_total = 0.0
         self.processing_fps = 0.0
 
+        # self.id_color = [
+        #     (230, 159, 0),
+        #     (86, 180, 233),
+        #     (0, 158, 115),
+        #     (240, 228, 66),
+        #     (0, 114, 178),
+        #     (213, 94, 0),
+        #     (204, 121, 167),
+        #     (0, 0, 0),
+        # ]
+
         self.id_color = [
-            (230, 159, 0),
-            (86, 180, 233),
-            (0, 158, 115),
-            (240, 228, 66),
-            (0, 114, 178),
-            (213, 94, 0),
-            (204, 121, 167),
+            (0, 159, 230),
+            (233, 180, 86),
+            (115, 158, 0),
+            (66, 228, 240),
+            (178, 114, 0),
+            (0, 94, 213),
+            (167, 121, 204),
             (0, 0, 0),
         ]
 
@@ -849,199 +859,6 @@ class Worker(QThread):
         self.running = False
         self.recording_stop_requested = True
 
-    def draw_processing_time(
-            self,
-            frame,
-            yolo_ms,
-            osnet_ms,
-            match_ms,
-            total_ms
-    ):
-        smooth_alpha = 0.9
-
-        if self.time_total == 0.0:
-            self.time_yolo = yolo_ms
-            self.time_osnet = osnet_ms
-            self.time_match = match_ms
-            self.time_total = total_ms
-        else:
-            self.time_yolo = (
-                    smooth_alpha * self.time_yolo
-                    + (1.0 - smooth_alpha) * yolo_ms
-            )
-
-            self.time_osnet = (
-                    smooth_alpha * self.time_osnet
-                    + (1.0 - smooth_alpha) * osnet_ms
-            )
-
-            self.time_match = (
-                    smooth_alpha * self.time_match
-                    + (1.0 - smooth_alpha) * match_ms
-            )
-
-            self.time_total = (
-                    smooth_alpha * self.time_total
-                    + (1.0 - smooth_alpha) * total_ms
-            )
-
-        if self.time_total > 0:
-            self.processing_fps = 1000.0 / self.time_total
-        else:
-            self.processing_fps = 0.0
-
-        lines = [
-            f"YOLO   : {self.time_yolo:.2f} ms",
-            f"OSNet  : {self.time_osnet:.2f} ms",
-            f"Match  : {self.time_match:.2f} ms",
-            f"Total  : {self.time_total:.2f} ms",
-            f"FPS    : {self.processing_fps:.1f}",
-        ]
-
-        x = 15
-        y = 30
-        line_height = 28
-
-        # 글자 배경
-        cv2.rectangle(
-            frame,
-            (5, 5),
-            (270, 155),
-            (0, 0, 0),
-            -1
-        )
-
-        for index, text in enumerate(lines):
-            cv2.putText(
-                frame,
-                text,
-                (x, y + index * line_height),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA
-            )
-
-    def set_recording_enabled(self, enabled):
-        """UI의 녹화 ON/OFF 스위치 상태를 반영합니다."""
-        self.recording_enabled = bool(enabled)
-
-        if not self.recording_enabled:
-            self.recording_stop_requested = True
-
-    def create_recording_path(self):
-        """현재 시간을 파일명으로 사용하고 중복 파일명은 방지합니다."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self.recording_dir / f"{timestamp}.mp4"
-
-        index = 1
-        while path.exists():
-            path = self.recording_dir / f"{timestamp}_{index:02d}.mp4"
-            index += 1
-
-        return path
-
-    def start_recording(self, raw_frame):
-        """박스, FPS, 마스크가 없는 원본 카메라 프레임 녹화를 시작합니다."""
-        if self.is_recording:
-            return
-
-        height, width = raw_frame.shape[:2]
-
-        camera_fps = float(self.cap.get(cv2.CAP_PROP_FPS))
-        if camera_fps <= 1.0 or camera_fps > 240.0:
-            camera_fps = 30.0
-
-        self.recording_fps = camera_fps
-        self.recording_path = self.create_recording_path()
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(
-            str(self.recording_path),
-            fourcc,
-            self.recording_fps,
-            (width, height)
-        )
-
-        if not writer.isOpened():
-            writer.release()
-            self.video_writer = None
-            self.recording_path = None
-            self.is_recording = False
-            self.status_signal.emit("VIDEO RECORDING START FAILED")
-            return
-
-        self.video_writer = writer
-        self.is_recording = True
-        self.recording_last_time = time.perf_counter()
-        self.status_signal.emit(
-            f"RECORDING STARTED: {self.recording_path.name}"
-        )
-
-    def stop_recording(self):
-        """현재 녹화 파일을 닫아 디스크에 정상 저장합니다."""
-        if self.video_writer is not None:
-            self.video_writer.release()
-            self.video_writer = None
-
-        if self.is_recording and self.recording_path is not None:
-            saved_path = self.recording_path
-            self.status_signal.emit(f"VIDEO SAVED: {saved_path}")
-
-        self.is_recording = False
-        self.recording_path = None
-        self.recording_last_time = None
-
-    def write_recording_frame(self, raw_frame):
-        """
-        모델 처리 때문에 프레임 간격이 길어져도 영상 재생속도가 빨라지지 않도록
-        경과 시간만큼 동일 프레임을 보충하여 기록합니다.
-        """
-        if not self.is_recording or self.video_writer is None:
-            return
-
-        now = time.perf_counter()
-
-        if self.recording_last_time is None:
-            frame_count = 1
-        else:
-            elapsed = max(0.0, now - self.recording_last_time)
-            frame_count = max(1, int(round(elapsed * self.recording_fps)))
-
-            # 일시적인 긴 정지로 과도한 프레임이 기록되는 것 방지
-            max_fill_frames = max(1, int(self.recording_fps * 2.0))
-            frame_count = min(frame_count, max_fill_frames)
-
-        for _ in range(frame_count):
-            self.video_writer.write(raw_frame)
-
-        self.recording_last_time = now
-
-    def update_recording(self, raw_frame):
-        """Live/스위치 상태에 따라 녹화를 시작, 기록 또는 종료합니다."""
-        if self.recording_stop_requested:
-            if self.is_recording:
-                self.stop_recording()
-            self.recording_stop_requested = False
-
-        should_record = self.live_on and self.recording_enabled
-
-        if should_record:
-            if not self.is_recording:
-                self.start_recording(raw_frame)
-
-            self.write_recording_frame(raw_frame)
-        elif self.is_recording:
-            self.stop_recording()
-
-    def toggle_live(self):
-        self.live_on = not self.live_on
-
-        if self.live_on:
-            self.mode = "live"
-        else:
-            self.mode = "idle"
 
     def run(self):
         while self.running:
@@ -1513,9 +1330,25 @@ class MainWindow(QMainWindow):
         self.id_labels = {}
 
         id_layout = QHBoxLayout()
+        id_button_colors = [
+            "#E69F00",
+            "#56B4E9",
+            "#009E73",
+            "#F0E442",
+            "#0072B2",
+            "#D55E00",
+            "#CC79A7",
+            "#333333",
+        ]
 
         for i in range(8):
             btn = QPushButton(f"ID {i}")
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {id_button_colors[i]};
+                    color: white;
+                }}
+            """)
             btn.clicked.connect(lambda _, x=i: self.select_id(x))
 
             label = QLabel("❌")
