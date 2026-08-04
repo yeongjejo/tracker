@@ -2,28 +2,256 @@ import os
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from pathlib import Path
+import onnxruntime as ort
 
+from datetime import datetime
 
 # ==============================
 # 설정값
 # ==============================
-
-IMAGE_PATH = "img.png"          # 입력 이미지 경로
-MODEL_PATH = "yolo11n-seg.pt"  # 또는 "yolov8n-seg.pt"
-OUTPUT_DIR = "output2"
+IMAGE_PATH = "color/yellow.png"          # 입력 이미지 경로
+MODEL_PATH = "yolo26n-seg.pt"  # 또는 "yolov8n-seg.pt"
+OUTPUT_DIR = "color/yellow"
 
 CONF_THRES = 0.35                 # 사람 검출 신뢰도
 MASK_THRES = 0.5                  # segmentation mask threshold
 
 SAVE_EACH_PERSON_CROP = True      # 사람별 crop 저장
-SAVE_FULL_IMAGE = True            # 전체 이미지 기준 배경 흰색 저장
+SAVE_FULL_IMAGE = False            # 전체 이미지 기준 배경 흰색 저장
 SAVE_LARGEST_PERSON_ONLY = False  # 가장 큰 사람 1명만 처리할지 여부
+
+
+
+model_path = str(Path("osnet_x1_0.onnx").resolve())
+engine_cache_dir = str(Path("./osnet_trt_cache").resolve())
+
+os.makedirs(engine_cache_dir, exist_ok=True)
+
+available_providers = ort.get_available_providers()
+print("Available providers:", available_providers)
+
+if "TensorrtExecutionProvider" not in available_providers:
+    raise RuntimeError(
+        "TensorrtExecutionProvider를 사용할 수 없습니다. "
+        "onnxruntime-gpu, CUDA 및 TensorRT 설치 상태를 확인하세요."
+    )
+
+providers = [
+    (
+        "TensorrtExecutionProvider",
+        {
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": engine_cache_dir,
+            "trt_fp16_enable": True,
+        }
+    ),
+    (
+        "CUDAExecutionProvider",
+        {
+            "device_id": 0
+        }
+    ),
+    "CPUExecutionProvider"
+]
+
+session = ort.InferenceSession(
+    model_path,
+    providers=providers
+)
+
+input_name = session.get_inputs()[0].name
+output_name = session.get_outputs()[0].name
+
+
+def save_feature(gid, features):
+
+    if features is None or features.shape[0] == 0:
+        print('저장할 feature가 없음')
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-5]
+
+    file_path = f"./testfeature//reid_feature_id_{gid}_{timestamp}.npz"
+
+    if not file_path:
+        return
+
+    save_path = Path(file_path)
+    if save_path.suffix.lower() != ".npz":
+        save_path = save_path.with_suffix(".npz")
+
+    try:
+        np.savez_compressed(
+            str(save_path),
+            format_version=np.array([1], dtype=np.int32),
+            gid=np.array([gid], dtype=np.int32),
+            features=np.ascontiguousarray(
+                features,
+                dtype=np.float32
+            ),
+            feature_count=np.array(
+                [features.shape[0]],
+                dtype=np.int32
+            ),
+            feature_dim=np.array(
+                [features.shape[1]],
+                dtype=np.int32
+            ),
+            model_name=np.array(["osnet_x1_0"], dtype="<U32"),
+            saved_at=np.array(
+                [datetime.now().isoformat(timespec="seconds")],
+                dtype="<U32"
+            )
+        )
+    except Exception as error:
+        print('피쳐 저장 실피 : ', error)
+        return
+
+
+
+
+def normalize_feature_array(features):
+    features = np.asarray(features, dtype=np.float32)
+
+    if features.ndim == 1:
+        features = features.reshape(1, -1)
+
+    if features.ndim != 2:
+        raise ValueError(
+            f"Feature 배열은 [N, D] 형태여야 합니다: {features.shape}"
+        )
+
+    if features.shape[0] == 0:
+        raise ValueError("Feature 데이터가 비어 있습니다.")
+
+    if features.shape[1] != 512:
+        raise ValueError(
+            "Feature 차원이 올바르지 않습니다. "
+            f"expected=512, actual={features.shape[1]}"
+        )
+
+    if not np.all(np.isfinite(features)):
+        raise ValueError("Feature 데이터에 NaN 또는 Inf가 포함되어 있습니다.")
+
+    norms = np.linalg.norm(features, axis=1, keepdims=True)
+    valid = norms[:, 0] > 1e-12
+
+    if not np.all(valid):
+        features = features[valid]
+        norms = norms[valid]
+
+    if features.shape[0] == 0:
+        raise ValueError("유효한 Feature 벡터가 없습니다.")
+
+    return np.ascontiguousarray(
+        features / np.maximum(norms, 1e-12),
+        dtype=np.float32
+    )
+
+def preprocess(img_bgr):
+    if img_bgr is None or img_bgr.size == 0:
+        return None
+
+    # OpenCV BGR → RGB
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    # OSNet 입력: width=128, height=256
+    img_rgb = cv2.resize(
+        img_rgb,
+        (128, 256),
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    image = img_rgb.astype(np.float32) / 255.0
+
+    # Torchreid 기본 ImageNet 정규화
+    mean = np.array(
+        [0.485, 0.456, 0.406],
+        dtype=np.float32
+    )
+
+    std = np.array(
+        [0.229, 0.224, 0.225],
+        dtype=np.float32
+    )
+
+    image = (image - mean) / std
+
+    # HWC → CHW
+    image = image.transpose(2, 0, 1)
+
+    # CHW → NCHW
+    image = np.expand_dims(image, axis=0)
+
+    return np.ascontiguousarray(
+        image,
+        dtype=np.float32
+    )
+
+
+
+def extract(img_bgr):
+    features = extract_batch([img_bgr])
+
+    if len(features) == 0:
+        return None
+
+    return features[0]
+
+
+def extract_batch(images_bgr):
+    tensors = []
+
+    for image in images_bgr:
+        tensor = preprocess(image)
+
+        if tensor is not None:
+            # preprocess 결과: [1, 3, 256, 128]
+            # 배치 결합을 위해 첫 번째 축 제거
+            tensors.append(tensor[0])
+
+    if not tensors:
+        return np.empty((0, 512), dtype=np.float32)
+
+    # [N, 3, 256, 128]
+    batch = np.stack(
+        tensors,
+        axis=0
+    ).astype(np.float32)
+
+    batch = np.ascontiguousarray(batch)
+
+    features = session.run(
+        [output_name],
+        {
+            input_name: batch
+        }
+    )[0]
+
+    features = np.asarray(
+        features,
+        dtype=np.float32
+    )
+
+    # 혹시 출력이 [N, 512, 1, 1] 형태인 경우 대비
+    features = features.reshape(features.shape[0], -1)
+
+    # 각 Feature L2 정규화
+    norms = np.linalg.norm(
+        features,
+        axis=1,
+        keepdims=True
+    )
+
+    features = features / np.maximum(norms, 1e-12)
+
+    return features
 
 
 # ==============================
 # 유틸 함수
 # ==============================
-
 def make_odd_kernel(value):
     value = int(value)
     if value < 3:
@@ -85,10 +313,12 @@ def clip_box(box, img_w, img_h):
 # 메인 처리
 # ==============================
 
-def main():
+def main(id, path):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    img = cv2.imread(IMAGE_PATH)
+    IMAGE_PATH = path
+
+    img = cv2.imread(str(IMAGE_PATH))
 
     if img is None:
         raise FileNotFoundError(f"이미지를 불러올 수 없습니다: {IMAGE_PATH}")
@@ -134,6 +364,7 @@ def main():
     # 1. 사람별 bbox crop 후 배경 흰색 처리
     # ==============================
     if SAVE_EACH_PERSON_CROP:
+        buffer = []
         for idx, (box, mask) in enumerate(zip(boxes, masks)):
             x1, y1, x2, y2 = clip_box(box, img_w, img_h)
 
@@ -155,10 +386,20 @@ def main():
                 person_mask=crop_mask
             )
 
-            save_path = os.path.join(OUTPUT_DIR, f"person_{idx}_crop_white.png")
-            cv2.imwrite(save_path, output_crop)
+            # save_path = os.path.join(OUTPUT_DIR, f"person_{idx}_crop_white.png")
+            # cv2.imwrite(save_path, output_crop)
+            # print(f"crop 저장 완료: {save_path}")
 
-            print(f"crop 저장 완료: {save_path}")
+            feat = extract(output_crop) #피쳐 저장
+            buffer.append(feat)
+
+        normalized = normalize_feature_array(buffer)
+        np_normalized = np.asarray(
+            normalized,
+            dtype=np.float32
+        ).copy()
+
+        save_feature(id, np_normalized)
 
     # ==============================
     # 2. 전체 이미지 기준 사람은 원본, 배경은 흰색 처리
@@ -182,4 +423,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    color_list = ['orange', 'bluesky', 'green', 'yellow', 'blue', 'purple', 'pink', 'black']
+    #
+    # for i, color in enumerate(color_list):
+    #     main(i, color)
+
+    for i, color in enumerate(color_list):
+        folder_path = Path("./color/"+color)
+        for path in folder_path.glob("*.png"):
+            main(i, path)

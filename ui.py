@@ -173,6 +173,7 @@ class GlobalMemory:
 
     def __init__(self):
         self.base_data = {}  # id -> [N, 512] base features
+        self.base_mean_data = {}  # id -> [N, 512] base features
         self.real_time_data = {i: [] for i in range(8)}
         self.unknown_data = {}
         self.real_time_count = [100 for _ in range(8)]
@@ -243,10 +244,18 @@ class GlobalMemory:
         )
 
     def add(self, gid, features):
+        gid = int(gid)
         normalized = self.normalize_feature_array(features)
 
         with self.data_lock:
             self.base_data[int(gid)] = normalized.copy()
+            base_mean = np.mean(normalized.copy(), axis=0)
+            base_mean = base_mean / max(
+                np.linalg.norm(base_mean),
+                1e-12
+            )
+            self.base_mean_data[int(gid)] = base_mean.copy()
+
             self.real_time_data[int(gid)] = []
             self.real_time_count[int(gid)] = 100
 
@@ -272,12 +281,19 @@ class GlobalMemory:
                 dtype=np.float32
             ).copy()
 
+    # add랑 중복이긴 한데 일단은 납두자 (추후 변경)
     def set_base_features(self, gid, features):
         gid = int(gid)
         normalized = self.normalize_feature_array(features)
 
         with self.data_lock:
             self.base_data[gid] = normalized.copy()
+            base_mean = np.mean(normalized.copy(), axis=0)
+            base_mean = base_mean / max(
+                np.linalg.norm(base_mean),
+                1e-12
+            )
+            self.base_mean_data[int(gid)] = base_mean.copy()
 
             # 이전 실행에서 생성된 보정 Feature가 새 파일에 섞이지 않도록 초기화
             self.real_time_data[gid] = []
@@ -314,20 +330,11 @@ class GlobalMemory:
                 un_best_score = score
                 un_best_id = gid
 
-        for gid, base_features in self.base_data.items():
-            base_mean = np.mean(base_features, axis=0)
-            base_mean = base_mean / max(
-                np.linalg.norm(base_mean),
-                1e-12
-            )
-
+        for gid, base_mean in self.base_mean_data.items():
             if len(self.real_time_data[gid]) > 0:
                 real_time_rate = 0.5 * (self.real_time_count[gid] / 100.0)
                 base_rate = 1.0 - real_time_rate
-                mean = (
-                    base_mean * base_rate
-                    + self.real_time_data[gid][0] * real_time_rate
-                )
+                mean = (base_mean * base_rate + self.real_time_data[gid][0] * real_time_rate)
             else:
                 mean = base_mean
 
@@ -385,6 +392,12 @@ class GlobalMemory:
                     break
 
         return None, None
+
+    def real_time_all_user_clear(self):
+        self.real_time_data = {i: [] for i in range(8)}
+        self.unknown_data = {}
+        self.real_time_count = [100 for _ in range(8)]
+        print("real_time Datta Clear!")
 
 
 # =========================
@@ -456,7 +469,7 @@ class Worker(QThread):
             (115, 158, 0),
             (66, 228, 240),
             (178, 114, 0),
-            (0, 94, 213),
+            (240, 32, 160),
             (167, 121, 204),
             (0, 0, 0),
         ]
@@ -697,25 +710,26 @@ class Worker(QThread):
         line_height = 28
 
         # 글자 배경
-        cv2.rectangle(
-            frame,
-            (5, 5),
-            (270, 155),
-            (0, 0, 0),
-            -1
-        )
+        # cv2.rectangle(
+        #     frame,
+        #     (5, 5),
+        #     (270, 155),
+        #     (0, 0, 0),
+        #     -1
+        # )
 
-        for index, text in enumerate(lines):
-            cv2.putText(
-                frame,
-                text,
-                (x, y + index * line_height),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA
-            )
+        # 타임 아웃 표시
+        # for index, text in enumerate(lines):
+        #     cv2.putText(
+        #         frame,
+        #         text,
+        #         (x, y + index * line_height),
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         0.65,
+        #         (0, 255, 255),
+        #         2,
+        #         cv2.LINE_AA
+        #     )
 
     def set_recording_enabled(self, enabled):
         """UI의 녹화 ON/OFF 스위치 상태를 반영합니다."""
@@ -843,9 +857,11 @@ class Worker(QThread):
             if self.source_type == "video" and self.cap is not None:
                 total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-
+                print(111111)
                 if total_frames > 0 and current_frame >= total_frames - 1:
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            else:
+                self.memory.real_time_all_user_clear()
 
             self.reset_runtime_stats()
         else:
@@ -899,6 +915,7 @@ class Worker(QThread):
             ret, raw_frame = self.cap.read()
             if not ret or raw_frame is None:
                 if self.source_type == "video":
+                    self.memory.real_time_all_user_clear()
                     self.finish_video_playback()
                 else:
                     self.msleep(10)
@@ -928,17 +945,18 @@ class Worker(QThread):
                     self.fps = current_fps
                 else:
                     self.fps = self.fps * 0.9 + current_fps * 0.1
-
-            cv2.putText(
-                frame,
-                f"FPS : {self.fps:.1f}",
-                (15, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA
-            )
+            
+            # FPS시간
+            # cv2.putText(
+            #     frame,
+            #     f"FPS : {self.fps:.1f}",
+            #     (15, 35),
+            #     cv2.FONT_HERSHEY_SIMPLEX,
+            #     1,
+            #     (0, 255, 255),
+            #     2,
+            #     cv2.LINE_AA
+            # )
 
             # =========================
             # MODE ROUTING
@@ -997,7 +1015,7 @@ class Worker(QThread):
 
             self.buffer.append(feat)
 
-        if len(self.buffer) > 100:
+        if len(self.buffer) > 1000:
             self.memory.add(self.target_id, self.buffer)
 
             self.status_signal.emit(f"ID {self.target_id} SAVED ✔")
@@ -1008,6 +1026,7 @@ class Worker(QThread):
         self.buffer = []
         if id in self.memory.base_data.keys():
             del self.memory.base_data[id]
+            del self.memory.base_mean_data[id]
         self.memory.real_time_data[id] = []
 
 
@@ -1116,13 +1135,13 @@ class Worker(QThread):
                 if gid in re_id:
                     if re_id[gid][0] < score:
                         color = (255, 255, 255)
-                        label = (f"Mismatching!! ")
+                        label = (f"GID:{gid} Mismatching!! ")
                         self.draw_bounding_box(color, label, frame, re_id[gid][1])
 
                         re_id[gid] = [score, box]
                     else:
                         color = (255, 255, 255)
-                        label = (f"Mismatching!! ")
+                        label = (f"GID:{gid} Mismatching!! ")
                         self.draw_bounding_box(color, label, frame, box)
                 else:
                     re_id[gid] = [score, box]
@@ -1336,7 +1355,7 @@ class MainWindow(QMainWindow):
             "#009E73",
             "#F0E442",
             "#0072B2",
-            "#D55E00",
+            "#A020F0",
             "#CC79A7",
             "#333333",
         ]
